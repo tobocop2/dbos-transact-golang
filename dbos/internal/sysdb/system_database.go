@@ -2168,11 +2168,28 @@ func (s *SysDB) CancelWorkflows(ctx context.Context, input CancelWorkflowsDBInpu
 	workflowIDs := make([]string, len(input.WorkflowIDs))
 	copy(workflowIDs, input.WorkflowIDs)
 
+	// Dialects without data-modifying CTEs (sqlite) read the children and
+	// cancel them in one transaction. A child start that commits between a
+	// read outside it and the cancel would keep running under a cancelled
+	// parent. When DBOS opens the database, sqlite begins the transaction
+	// IMMEDIATE, so a child start fails at once or after the cancel.
+	tx := input.Tx
+	var localTx Tx
+	if tx == nil && !s.dialect.SupportsDataModifyingCTE() {
+		begun, err := s.pool.BeginTx(ctx, TxOptions{IsoLevel: s.dialect.SnapshotIsolation()})
+		if err != nil {
+			return nil, fmt.Errorf("failed to begin transaction: %w", err)
+		}
+		defer begun.Rollback(ctx)
+		localTx = begun
+		tx = begun
+	}
+
 	if input.CancelChildren {
 		for _, workflowID := range workflowIDs {
 			children, err := s.GetWorkflowChildren(ctx, GetWorkflowChildrenDBInput{
 				WorkflowID: workflowID,
-				Tx:         input.Tx,
+				Tx:         tx,
 			})
 			if err != nil {
 				return nil, err
@@ -2204,8 +2221,8 @@ func (s *SysDB) CancelWorkflows(ctx context.Context, input CancelWorkflowsDBInpu
 	}
 
 	// Dialects without data-modifying CTEs (sqlite) split the pg
-	// single-statement CTE into two statements (UPDATE then SELECT).
-	// Needs repeatable read. Reuse the caller's tx when supplied.
+	// single-statement CTE into two statements (UPDATE then SELECT), in the
+	// transaction of the read of the children.
 	if !s.dialect.SupportsDataModifyingCTE() {
 		updateQuery := s.RenderSQL(`UPDATE %sworkflow_status
 			SET status = $1, updated_at = %s, completed_at = %s, started_at_epoch_ms = NULL,
@@ -2214,24 +2231,10 @@ func (s *SysDB) CancelWorkflows(ctx context.Context, input CancelWorkflowsDBInpu
 		selectAnyClause := dialectAnyClause(s.dialect, "workflow_uuid", 1)
 		selectQuery := s.RenderSQL(`SELECT workflow_uuid FROM %sworkflow_status WHERE %s`, schemaPrefix, selectAnyClause)
 
-		var runner Querier
-		var localTx Tx
-		if input.Tx != nil {
-			runner = input.Tx
-		} else {
-			tx, err := s.pool.BeginTx(ctx, TxOptions{IsoLevel: s.dialect.SnapshotIsolation()})
-			if err != nil {
-				return nil, fmt.Errorf("failed to begin transaction: %w", err)
-			}
-			defer tx.Rollback(ctx)
-			localTx = tx
-			runner = tx
-		}
-
-		if _, err := runner.Exec(ctx, updateQuery, args...); err != nil {
+		if _, err := tx.Exec(ctx, updateQuery, args...); err != nil {
 			return nil, fmt.Errorf("failed to cancel workflows: %w", err)
 		}
-		rows, err := runner.Query(ctx, selectQuery, args[1])
+		rows, err := tx.Query(ctx, selectQuery, args[1])
 		if err != nil {
 			return nil, fmt.Errorf("failed to list cancelled workflow ids: %w", err)
 		}
