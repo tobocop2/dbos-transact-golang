@@ -2508,6 +2508,7 @@ func TestClientCustomSqliteDB(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "dbos.db")
 	serverDB, err := sql.Open("sqlite", dbPath)
 	require.NoError(t, err)
+	t.Cleanup(func() { serverDB.Close() })
 	serverCtx, err := NewContext(context.Background(), Config{
 		AppName:        "test-client-custom-sqlite-db",
 		SQLiteSystemDB: serverDB,
@@ -2528,6 +2529,7 @@ func TestClientCustomSqliteDB(t *testing.T) {
 
 	clientDB, err := sql.Open("sqlite", dbPath)
 	require.NoError(t, err)
+	t.Cleanup(func() { clientDB.Close() })
 
 	c, err := NewClient(context.Background(), ClientConfig{SQLiteSystemDB: clientDB})
 	require.NoError(t, err)
@@ -2573,6 +2575,7 @@ func TestClientCustomPool(t *testing.T) {
 	require.NoError(t, err)
 	clientPool, err := pgxpool.NewWithConfig(context.Background(), clientPoolConfig)
 	require.NoError(t, err)
+	t.Cleanup(clientPool.Close)
 
 	c, err := NewClient(context.Background(), ClientConfig{SystemDBPool: clientPool})
 	require.NoError(t, err)
@@ -2701,6 +2704,23 @@ func TestClientGetEvent(t *testing.T) {
 	})
 
 	require.True(t, queueEntriesAreCleanedUp(serverCtx), "expected queue entries to be cleaned up after get event test")
+}
+
+// TestClientHoldsNoListenerConnection verifies a client keeps no LISTEN
+// connection checked out of its pool.
+func TestClientHoldsNoListenerConnection(t *testing.T) {
+	skipIfSqlite(t, "inspects the pgx pool")
+	setupDBOS(t, setupDBOSOptions{dropDB: true}) // migrates the schema the client verifies
+
+	client, err := NewClient(context.Background(), ClientConfig{DatabaseURL: backendDatabaseURL(t)})
+	require.NoError(t, err)
+	t.Cleanup(func() { client.Shutdown(client, 30*time.Second) })
+
+	// The listener is the only connection an idle client would hold.
+	pool := PgxPool(client.(*dbosContext).systemDB.(*sysdb.SysDB).Pool())
+	require.Never(t, func() bool {
+		return pool.Stat().AcquiredConns() > 0
+	}, 500*time.Millisecond, 10*time.Millisecond, "an idle client should hold no connection")
 }
 
 // TestClientTypedHandles verifies the typed handle helpers (ClientRetrieveWorkflow,
