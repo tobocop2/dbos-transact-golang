@@ -24,8 +24,8 @@ type cancelWorkflow struct {
 // placeholder it reads against the statement's arguments, and a placeholder that names no
 // argument, or an argument of the wrong type, is an error. It reads these placeholders:
 // in a sharded children statement, each parent key and list of IDs; in an unsharded one,
-// its list of IDs; in a cancel statement, the first list of IDs, the first shard key and
-// the new status. It does not check the rest of the SQL.
+// its list of IDs; in a cancel statement, the first list of IDs, the first shard key, the
+// new status and the statuses it leaves alone. It does not check the rest of the SQL.
 type cancelFake struct {
 	workflows []*cancelWorkflow
 }
@@ -36,6 +36,7 @@ var (
 	cancelIDsTerm         = regexp.MustCompile(`workflow_uuid = ANY\(\$(\d+)\)`)
 	cancelKeyTerm         = regexp.MustCompile(` AND shard_key = \$(\d+)`)
 	cancelStatusTerm      = regexp.MustCompile(`SET status = \$(\d+)`)
+	cancelKeptTerm        = regexp.MustCompile(`status NOT IN \(\$(\d+), \$(\d+), \$(\d+)\)`)
 )
 
 func placeholderArg[T any](args []any, placeholder string) (T, error) {
@@ -86,8 +87,17 @@ func (f *cancelFake) answer(query string, args []any) (Rows, error) {
 	}
 	idsTerm := cancelIDsTerm.FindStringSubmatch(query)
 	statusTerm := cancelStatusTerm.FindStringSubmatch(query)
-	if idsTerm == nil || statusTerm == nil {
+	keptTerm := cancelKeptTerm.FindStringSubmatch(query)
+	if idsTerm == nil || statusTerm == nil || keptTerm == nil {
 		return nil, errors.New("the statement is neither a children statement nor a cancel statement")
+	}
+	var kept []models.WorkflowStatusType
+	for _, placeholder := range keptTerm[1:] {
+		status, err := placeholderArg[models.WorkflowStatusType](args, placeholder)
+		if err != nil {
+			return nil, err
+		}
+		kept = append(kept, status)
 	}
 	ids, err := placeholderArg[[]string](args, idsTerm[1])
 	if err != nil {
@@ -109,7 +119,7 @@ func (f *cancelFake) answer(query string, args []any) (Rows, error) {
 			continue
 		}
 		out = append(out, []any{w.id})
-		if w.status != models.WorkflowStatusSuccess && w.status != models.WorkflowStatusError && w.status != models.WorkflowStatusCancelled {
+		if !slices.Contains(kept, w.status) {
 			w.status = status
 		}
 	}
@@ -214,4 +224,41 @@ func TestCancelWorkflowsUnshardedRunsOnPool(t *testing.T) {
 	assert.NotZero(t, pool.queries, "the pool runs the statements")
 	assert.Zero(t, tx.queries)
 	assert.Equal(t, models.WorkflowStatusCancelled, fake.statuses()["g1"])
+}
+
+func failedRootCancelFixture() []*cancelWorkflow {
+	return []*cancelWorkflow{
+		{id: "parent", key: "k1", status: models.WorkflowStatusError},
+		{id: "open", key: "k2", parentID: "parent", parentKey: "k1", status: models.WorkflowStatusPending},
+		{id: "failed", key: "k3", parentID: "parent", parentKey: "k1", status: models.WorkflowStatusError},
+	}
+}
+
+// A sharded cancel with CancelFailed ends a given workflow in ERROR and leaves a child in ERROR alone.
+func TestCancelWorkflowsShardedCancelFailedEndsTheFailedRootOnly(t *testing.T) {
+	s, fake, _, _ := newCancelSysDB(true, failedRootCancelFixture())
+	ctx := WithShardKeys(context.Background(), map[string]string{"parent": "k1"})
+
+	found, err := s.CancelWorkflows(ctx, CancelWorkflowsDBInput{WorkflowIDs: []string{"parent"}, CancelChildren: true, CancelFailed: true})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"parent"}, found)
+	assert.Equal(t, map[string]models.WorkflowStatusType{
+		"parent": models.WorkflowStatusCancelled,
+		"open":   models.WorkflowStatusCancelled,
+		"failed": models.WorkflowStatusError,
+	}, fake.statuses())
+}
+
+// A sharded cancel without CancelFailed leaves a given workflow in ERROR alone and still cancels its open child.
+func TestCancelWorkflowsShardedWithoutCancelFailedLeavesTheFailedRoot(t *testing.T) {
+	s, fake, _, _ := newCancelSysDB(true, failedRootCancelFixture())
+	ctx := WithShardKeys(context.Background(), map[string]string{"parent": "k1"})
+
+	_, err := s.CancelWorkflows(ctx, CancelWorkflowsDBInput{WorkflowIDs: []string{"parent"}, CancelChildren: true})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]models.WorkflowStatusType{
+		"parent": models.WorkflowStatusError,
+		"open":   models.WorkflowStatusCancelled,
+		"failed": models.WorkflowStatusError,
+	}, fake.statuses())
 }
