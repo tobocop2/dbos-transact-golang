@@ -12430,6 +12430,24 @@ func TestRewind(t *testing.T) {
 		return msg, nil
 	}
 
+	// Takes one message on its first run, and two on every replay.
+	var keepRuns atomic.Int64
+	keepWorkflow := func(ctx Context, _ string) (string, error) {
+		run := keepRuns.Add(1)
+		first, err := Recv[string](ctx, "inbox", 20*time.Second)
+		if err != nil {
+			return "", err
+		}
+		if run == 1 {
+			return first, nil
+		}
+		second, err := Recv[string](ctx, "inbox", 20*time.Second)
+		if err != nil {
+			return "", err
+		}
+		return first + "," + second, nil
+	}
+
 	// Does nothing; it only ever needs to sit in a saturated queue's backlog.
 	idleWorkflow := func(ctx Context, _ string) (string, error) {
 		return "idle", nil
@@ -12450,6 +12468,7 @@ func TestRewind(t *testing.T) {
 	RegisterWorkflow(dbosCtx, publisher, WithWorkflowName("rewindPublisherWorkflow"))
 	RegisterWorkflow(dbosCtx, divergentPublisher, WithWorkflowName("rewindDivergentPublisher"))
 	RegisterWorkflow(dbosCtx, recvWorkflow, WithWorkflowName("rewindRecvWorkflow"))
+	RegisterWorkflow(dbosCtx, keepWorkflow, WithWorkflowName("rewindKeepWorkflow"))
 	RegisterWorkflow(dbosCtx, idleWorkflow, WithWorkflowName("rewindIdleWorkflow"))
 	RegisterWorkflow(dbosCtx, blocker, WithWorkflowName("rewindBlockingWorkflow"))
 	// One slot, so a blocked workflow leaves everything behind it ENQUEUED.
@@ -12781,6 +12800,59 @@ func TestRewind(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "second", result, "the replay took the new message, not the deleted one")
 		assert.Equal(t, int64(2), recvRuns.Load())
+	})
+
+	// runKeepWorkflow runs keepWorkflow to success on message "a", then sends "b", which
+	// stays unread. It returns the workflow ID.
+	runKeepWorkflow := func(t *testing.T) string {
+		t.Helper()
+		keepRuns.Store(0)
+		workflowID := uuid.NewString()
+		handle, err := RunWorkflow(dbosCtx, keepWorkflow, "", WithWorkflowID(workflowID))
+		require.NoError(t, err)
+		require.NoError(t, Send(dbosCtx, workflowID, "a", "inbox"))
+		got, err := handle.GetResult()
+		require.NoError(t, err)
+		require.Equal(t, "a", got)
+		// Messages sort by arrival millisecond, so keep the two apart.
+		time.Sleep(5 * time.Millisecond)
+		require.NoError(t, Send(dbosCtx, workflowID, "b", "inbox"))
+		return workflowID
+	}
+
+	t.Run("KeepMessagesDeliversTakenAndUnreadMessagesOnce", func(t *testing.T) {
+		workflowID := runKeepWorkflow(t)
+
+		_, err := RewindWorkflow[string](dbosCtx, workflowID, WithRewindKeepMessages())
+		require.NoError(t, err)
+
+		replayed, err := RetrieveWorkflow[string](dbosCtx, workflowID)
+		require.NoError(t, err)
+		result, err := replayed.GetResult()
+		require.NoError(t, err)
+		assert.Equal(t, "a,b", result, "the replay took the message the dropped recv had taken, then the unread one, in arrival order")
+		assert.Equal(t, 2, rawQueryInt(t, dbosCtx,
+			`SELECT COUNT(*) FROM %snotifications WHERE destination_uuid = $1 AND consumed = true`, workflowID),
+			"each message is taken once")
+		assert.Equal(t, 0, rawQueryInt(t, dbosCtx,
+			`SELECT COUNT(*) FROM %snotifications WHERE destination_uuid = $1 AND consumed = false`, workflowID))
+	})
+
+	t.Run("KeepMessagesLeavesMessagesTakenBelowTheCutConsumed", func(t *testing.T) {
+		workflowID := runKeepWorkflow(t)
+		takenAt := rawQueryInt(t, dbosCtx,
+			`SELECT consumed_by_function_id FROM %snotifications WHERE destination_uuid = $1 AND consumed = true`, workflowID)
+
+		// The cut is past the recv, so the recorded step stays and its message stays taken.
+		_, err := RewindWorkflow[string](dbosCtx, workflowID,
+			WithRewindStartStep(uint(takenAt+1)), WithRewindKeepMessages())
+		require.NoError(t, err)
+
+		replayed, err := RetrieveWorkflow[string](dbosCtx, workflowID)
+		require.NoError(t, err)
+		result, err := replayed.GetResult()
+		require.NoError(t, err)
+		assert.Equal(t, "a,b", result, "a message taken below the cut is not delivered a second time")
 	})
 
 	t.Run("RewindsOntoADifferentApplicationVersion", func(t *testing.T) {

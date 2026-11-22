@@ -5811,6 +5811,17 @@ func WithRewindStartStep(startStep uint) RewindWorkflowOption {
 	}
 }
 
+// WithRewindKeepMessages keeps the workflow's messages across the rewind. A message that a
+// dropped step took becomes unread again, and a message that was unread stays unread, so
+// the replay receives each of them once, oldest first by the millisecond they were sent.
+// Messages sent in the same millisecond have no defined order. A message taken below the
+// cut stays taken. Without this option the rewind deletes both kinds.
+func WithRewindKeepMessages() RewindWorkflowOption {
+	return func(o *models.RewindWorkflowInput) {
+		o.KeepMessages = true
+	}
+}
+
 func (c *dbosContext) RewindWorkflow(_ Client, workflowID string, opts ...RewindWorkflowOption) (WorkflowHandle[any], error) {
 	if workflowID == "" {
 		return nil, models.NewInvalidOptionError("workflowID is required")
@@ -5830,6 +5841,7 @@ func (c *dbosContext) RewindWorkflow(_ Client, workflowID string, opts ...Rewind
 		ApplicationVersion: params.ApplicationVersion,
 		QueueName:          params.QueueName,
 		QueuePartitionKey:  params.QueuePartitionKey,
+		KeepMessages:       params.KeepMessages,
 	}
 	dataSources := c.registeredDataSources()
 	for _, d := range params.DataSources {
@@ -5927,6 +5939,10 @@ func (c *dbosContext) rewindDataSources(ctx context.Context, tx Tx, dataSources 
 //     ones rather than taking delivery a second time.
 //   - Every unconsumed message is deleted too, including one sent before the rewind.
 //     Send only once the rewind has returned for the replay to receive it.
+//     With WithRewindKeepMessages, neither kind is deleted: a message a dropped Recv took
+//     becomes unread again, and an unread message stays, so the replay receives each of
+//     them once, oldest first by the millisecond they were sent. Messages sent in the same
+//     millisecond have no defined order. A message taken below the cut stays taken.
 //   - Checkpoints held in data sources are dropped along with the steps that wrote them,
 //     so the replay re-runs those transactions. A Context created with NewContext knows
 //     the data sources registered on it with NewDataSource; a Client must list them with
@@ -5943,6 +5959,7 @@ func (c *dbosContext) rewindDataSources(ctx context.Context, tx Tx, dataSources 
 //   - WithRewindQueue: re-enqueue on a named queue instead of the internal queue.
 //   - WithRewindQueuePartitionKey: re-enqueue onto a partition of that queue.
 //   - WithRewindDataSources: data sources whose checkpoints to drop, for a Client.
+//   - WithRewindKeepMessages: keep the mailbox instead of emptying it.
 //
 // Example:
 //
