@@ -3375,6 +3375,7 @@ type RewindWorkflowDBInput struct {
 	ApplicationVersion string
 	QueueName          string
 	QueuePartitionKey  string
+	KeepMessages       bool
 	Tx                 Tx
 }
 
@@ -3390,7 +3391,8 @@ type RewindWorkflowDBInput struct {
 //     below it, using workflow_events_history as an undo log. Events published after
 //     are discarded.
 //   - Messages the discarded run consumed at or past the cut are deleted, and so is
-//     every unconsumed message, whenever it was sent.
+//     every unconsumed message, whenever it was sent. With KeepMessages, the first
+//     kind become unconsumed again and the second kind stay as they are.
 //   - Stream entries are untouched.
 //
 // A replayed Send still duplicates into its destination's mailbox; that side effect
@@ -3512,11 +3514,22 @@ func (s *SysDB) RewindWorkflow(ctx context.Context, input RewindWorkflowDBInput)
 		}
 	}
 
-	// Delete messages consumed or received after the rewind point
-	consumedQuery := s.RenderSQL(`DELETE FROM %snotifications
-		WHERE destination_uuid = $1 AND (consumed_by_function_id >= $2 OR consumed = false)`+eventsKey, schemaPrefix)
-	if _, err := tx.Exec(ctx, consumedQuery, stepArgs...); err != nil {
-		return fmt.Errorf("failed to delete consumed notifications for workflow %s: %w", input.WorkflowID, err)
+	if input.KeepMessages {
+		// Mark messages taken at or after the rewind point as unread again. Unread
+		// messages and created_at stay, so the replay takes them in arrival order.
+		unreadQuery := s.RenderSQL(`UPDATE %snotifications
+			SET consumed = false, consumed_by_function_id = NULL
+			WHERE destination_uuid = $1 AND consumed_by_function_id >= $2`+eventsKey, schemaPrefix)
+		if _, err := tx.Exec(ctx, unreadQuery, stepArgs...); err != nil {
+			return fmt.Errorf("failed to restore consumed notifications for workflow %s: %w", input.WorkflowID, err)
+		}
+	} else {
+		// Delete messages consumed or received after the rewind point
+		consumedQuery := s.RenderSQL(`DELETE FROM %snotifications
+			WHERE destination_uuid = $1 AND (consumed_by_function_id >= $2 OR consumed = false)`+eventsKey, schemaPrefix)
+		if _, err := tx.Exec(ctx, consumedQuery, stepArgs...); err != nil {
+			return fmt.Errorf("failed to delete consumed notifications for workflow %s: %w", input.WorkflowID, err)
+		}
 	}
 
 	// Re-enqueue the workflow. An empty ApplicationVersion leaves the recorded one in place.
