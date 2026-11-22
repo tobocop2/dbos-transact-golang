@@ -3516,7 +3516,8 @@ func (s *SysDB) RewindWorkflow(ctx context.Context, input RewindWorkflowDBInput)
 
 	if input.KeepMessages {
 		// Mark messages taken at or after the rewind point as unread again. Unread
-		// messages and created_at stay, so the replay takes them in arrival order.
+		// messages and created_at stay, so the replay takes them oldest first by
+		// millisecond. Messages created in the same millisecond have no defined order.
 		unreadQuery := s.RenderSQL(`UPDATE %snotifications
 			SET consumed = false, consumed_by_function_id = NULL
 			WHERE destination_uuid = $1 AND consumed_by_function_id >= $2`+eventsKey, schemaPrefix)

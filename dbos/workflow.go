@@ -5813,8 +5813,9 @@ func WithRewindStartStep(startStep uint) RewindWorkflowOption {
 
 // WithRewindKeepMessages keeps the workflow's messages across the rewind. A message that a
 // dropped step took becomes unread again, and a message that was unread stays unread, so
-// the replay receives each of them once, in the order they arrived. A message taken below
-// the cut stays taken. Without this option the rewind deletes both kinds.
+// the replay receives each of them once, oldest first by the millisecond they were sent.
+// Messages sent in the same millisecond have no defined order. A message taken below the
+// cut stays taken. Without this option the rewind deletes both kinds.
 func WithRewindKeepMessages() RewindWorkflowOption {
 	return func(o *models.RewindWorkflowInput) {
 		o.KeepMessages = true
@@ -5940,7 +5941,8 @@ func (c *dbosContext) rewindDataSources(ctx context.Context, tx Tx, dataSources 
 //     Send only once the rewind has returned for the replay to receive it.
 //     With WithRewindKeepMessages, neither kind is deleted: a message a dropped Recv took
 //     becomes unread again, and an unread message stays, so the replay receives each of
-//     them once, in arrival order. A message taken below the cut stays taken.
+//     them once, oldest first by the millisecond they were sent. Messages sent in the same
+//     millisecond have no defined order. A message taken below the cut stays taken.
 //   - Checkpoints held in data sources are dropped along with the steps that wrote them,
 //     so the replay re-runs those transactions. A Context created with NewContext knows
 //     the data sources registered on it with NewDataSource; a Client must list them with
